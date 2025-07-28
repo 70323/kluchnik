@@ -5,6 +5,7 @@
 // --- networking libraries ---
 #include "esp_wifi.h"
 #include "esp_netif.h"
+#include "esp_log.h"
 
 // --- misc libraries ---
 #include <string.h>

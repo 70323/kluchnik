@@ -12,26 +12,29 @@
 #include <Adafruit_SH110X.h> // Using SH110X for 1.3" OLED
 #include "I2Cdev.h"
 #include "MPU6050.h"
+#include <Adafruit_SSD1306.h>
+#include <QRCodeGenerator.h>
+
 
 // --- Cryptography Library ---
 #include <mbedtls/aes.h>
 
 // --- Networking Libraries ---
-#include <WiFi.h>
 #include "tcp.ino"
 
-#define BUTTON_UP     13
-#define BUTTON_DOWN   12
-#define BUTTON_SELECT 14
+#define BUTTON_UP     5
+#define BUTTON_DOWN   17
+#define BUTTON_SELECT 16
 #define GATE_CONTROL_PIN 27
 #define COUNTER_RESET_PIN 26
-const int counterPins[8] = {4, 5, 15, 16, 17, 18, 19, 23};
+const int counterPins[8] = {35, 32, 33, 25, 26, 27, 14, 12};
 
 // --- Display & MPU Setup ---
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
-Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+#define QR_SCALE 2
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 MPU6050 mpu;
 
 // --- Main Menu Configuration ---
@@ -45,21 +48,31 @@ int8_t selector = 0;
 int8_t top_line_index = 0;
 long lastDebounceTime = 0;
 long debounceDelay = 200;
+#define MIN_PASSWORD_LEN 4
+#define MAX_PASSWORD_LEN 32
+
+// - Toggling display -
+static bool screenOn = true;
+unsigned long buttonPressStartTime = 0;
+static bool buttonHeld = false;
 
 // --- Networking variables & conditions ---
 static bool ap_enabled = false;
 esp_netif_ip_info_t ip_info;
 
+// -- IP address configuration ---
+#define AP_IP_ADDR 192, 168, 1, 4
+#define AP_GW_ADDR 192, 168, 1, 1
+#define AP_NETMASK 255, 255, 255, 255
+
 // --- Password Generation Settings ---
 static int passwordLength = 16;
-enum Complexity {
-  NUMBERS_ONLY, LOWERCASE_ONLY, UPPERCASE_ONLY,
-  LOWER_UPPER, LOWER_UPPER_NUM, ALL_CHARS
-};
+enum Complexity {  NUMBERS_ONLY, NUMBERS_LOWER, LOWER_UPPER_NUM, ALL_CHARS  };
 static uint8_t complexityLevel = ALL_CHARS;
 const char* complexityNames[] = {
   "Numbers", "Lowercase", "Uppercase", "Letters", "Alphanumeric", "All Symbols"
 };
+static byte randomBytes[MAX_PASSWORD_LEN * 16];
 
 // --- Cryptography ---
 #define KEY_SIZE 16
@@ -75,15 +88,14 @@ const unsigned char iv[BLOCK_SIZE] = {
 byte generatedKey[KEY_SIZE];
 
 /* FUNCTION DEFINITION */
-void  setup();
-void    loop();
+void setup();
+void loop();
 size_t applyPadding(const uint8_t*, size_t, uint8_t*);
 void encrypt_cbc(uint8_t*, size_t, const uint8_t*, uint8_t*, uint8_t*);
 byte readCounter();
 byte generateRandomByte();
-void runPasswordGeneration(WiFiClient);
-void sendToPC(WiFiClient, byte*, size_t);
-void handleRemoteClient();
+void runPasswordGeneration(uint8_t complexity);
+String filter_password(byte, uint8_t, uint8_t, byte*);
 void do_action_up();
 void do_action_down();
 void handleLocalInput();
@@ -95,11 +107,14 @@ void displayAbout();
 void tcpSendMessage(char*);
 esp_err_t wifiInitAP(void);
 static void wifi_event_handler(void*, esp_event_base_t, int32_t, void*);
-
+static void tcp_server_task(void *);
+uint8_t generateQR(char text[32]);
+void displayQR(uint8_t qr);
 
 /*========================================================================*/
 /* SETUP                                                                  */
 /*========================================================================*/
+
 void setup() {
   Serial.begin(115200);
   Wire.begin(); // Default I2C pins for ESP32 are 21 (SDA), 22 (SCL)
@@ -115,7 +130,7 @@ void setup() {
     pinMode(counterPins[i], INPUT);
   }
 
-  if (!display.begin(0x3C, true)) {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println(F("SH1106 allocation failed"));
     for (;;);
   }
@@ -131,17 +146,9 @@ void setup() {
     for (;;);
   }
 
-  if (!wifiInitAP()) {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SH110X_WHITE);
-    display.setCursor(0, 0);
-    display.println("WiFi Init Failed!");
-    display.display();
-    for (;;);
-  }
-  display.clearDisplay();
-  display.display();
+//  wifiInitAP();
+
+  //xTaskCreate(tcp_server_task, "tcp_server", 4096, NULL, 5, NULL);
 }
 
 /*========================================================================*/
@@ -149,7 +156,6 @@ void setup() {
 /*========================================================================*/
 void loop() {
   handleLocalInput();
-  handleRemoteClient();
   drawMenu();
 }
 
@@ -209,7 +215,8 @@ byte readCounter() {
 
 
 /* Using the readCounter() function, read a byte after a randomised amount of time. */
-byte generateRandomByte() {
+byte generateRandomByte() 
+{
   int16_t ax, ay, az, gx, gy, gz;
   digitalWrite(COUNTER_RESET_PIN, HIGH);
   delayMicroseconds(10);
@@ -228,7 +235,41 @@ byte generateRandomByte() {
   return readCounter();
 }
 
-void runPasswordGeneration(WiFiClient client) {
+
+
+/* Returns a password based on complexity level. */
+String filter_password(byte *key, uint8_t complexity, byte *randomBytes)
+{
+  String filtered = "";
+  String pass = String((char*)key);
+  for (uint8_t i = 0; i < passwordLength; i++) {
+    char c = pass[i];
+    bool included = false;
+
+    if ( (complexity == NUMBERS_ONLY && isdigit(c)
+      || (complexity == NUMBERS_LOWER && (isdigit(c) || (c >= 'a' && c <= 'z')))
+      || (complexity == LOWER_UPPER_NUM && (isdigit(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')))
+      || (complexity == ALL_CHARS && c >= 33 && c <= 126))) // all printable ASCII characters
+      included = true;
+    
+    if (included) filtered += c;
+  }
+  // pad password with extra characters
+  for (uint8_t i = 0; i < (pass.length() - filtered.length()); i++) {
+    byte rnd = generateRandomByte();
+    delayMicroseconds(20);
+    switch (complexity) {
+      case NUMBERS_ONLY: filtered += (char)('0' + (generateRandomByte() % 10)); break;
+      case NUMBERS_LOWER: filtered += (char)('a' + (generateRandomByte() % 26)); break;
+      case LOWER_UPPER_NUM: filtered += (char)('A' + (generateRandomByte() % 26)); break;
+      // After my death, I will be going to C programmer hell
+      case ALL_CHARS: filtered += "!@#$%^&*()_+-=[]{}|;:,.<>?"[generateRandomByte() % String("!@#$%^&*()_+-=[]{}|;:,.<>?").length()]; break;
+    }
+  }
+  return filtered;
+}
+
+void runPasswordGeneration(uint8_t complexity) {
   display.clearDisplay();
   display.setCursor(10, 5);
   display.print("Shaking device to");
@@ -236,10 +277,17 @@ void runPasswordGeneration(WiFiClient client) {
   display.print("gather entropy...");
   display.display();
 
-  // 1. Generate 16 random bytes
-  for (int i = 0; i < 16; i++) {
+  // 1. Generate random bytes for password length
+  for (int i = 0; i < passwordLength; i++) {
     generatedKey[i] = generateRandomByte();
+    delayMicroseconds(20); // more randomness
   }
+  for (int i = 0; i < MAX_PASSWORD_LEN * 4; i++) {
+    randomBytes[i] = generateRandomByte();
+    delayMicroseconds(20);
+  }
+
+  String password_string = filter_password(generatedKey, complexity, randomBytes);
   
   // 2. Pad the data. Since input is 16 bytes, output will be 32 bytes.
   uint8_t paddedData[32];
@@ -250,84 +298,45 @@ void runPasswordGeneration(WiFiClient client) {
   uint8_t iv_copy[BLOCK_SIZE]; // mbedtls modifies the IV, so we use a copy
   memcpy(iv_copy, iv, BLOCK_SIZE);
   encrypt_cbc(paddedData, paddedLen, encryptionKey, iv_copy, encryptedData);
-  
-  // 4. Send the encrypted data to the PC
-  sendToPC(client, encryptedData, paddedLen);
-  
-  display.clearDisplay();
-  display.setCursor(35, 12);
-  display.print("Data sent!");
-  display.display();
+ 
   delay(2000);
+  displayQR(password_string);
+  /* also should send data to pc */
 }
 
-void sendToPC(WiFiClient client, byte* dataToSend, size_t len) {
-  String payload = "LEN:" + String(passwordLength) +
-                   ",COMPLEX:" + String(complexityLevel) +
-                   ",KEY:";
-  
-  char hexBuffer[3];
-  for (size_t i = 0; i < len; i++) {
-    sprintf(hexBuffer, "%02X", dataToSend[i]);
-    payload += hexBuffer;
-  }
-  payload += "\n";
-  
-  client.print(payload);
-}
 
-/*void wifiInitAP() {
-  WiFi.softAP(AP_SSID, AP_PASSWD);
-  IPAddress IP = WiFi.softAPIP();
-  Serial.print("AP IP address: ");
-  Serial.println(IP);
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.println("AP: Kluchnik");
-  display.setCursor(0,10);
-  display.println(IP);
-  display.display();
-  server.begin();
-}*/
-void handleRemoteClient() {
-  /*WiFiClient client = server.available();
-  if (client) {
-    Serial.println("Client connected!");
-    String currentLine = "";
-    while (client.connected()) {
-      // Add a timeout to prevent blocking forever
-      unsigned long timeout = millis();
-      while(!client.available() && millis() - timeout < 1000) {
-        // Wait for data or timeout
-      }
-      if(!client.available()) {
-        break; // No data received, disconnect
-      }
-      
-      char c = client.read();
-      if (c == '\n') {
-        if (currentLine.startsWith("GET_DATA")) {
-          runPasswordGeneration(client);
-        } else if (currentLine.startsWith("CMD_UP")) {
-          do_action_up();
-        } else if (currentLine.startsWith("CMD_DOWN")) {
-          do_action_down();
-        } else if (currentLine.startsWith("CMD_SELECT")) {
-          performAction();
+
+// --- UI AND MENU FUNCTIONS ---
+
+void handleScreenToggle() 
+{
+  if (digitalRead(BUTTON_SELECT) == LOW) {
+    if (!buttonHeld) {
+      buttonPressStartTime = millis();
+      buttonHeld = true;
+    } else {
+      // Check if button has been held for 5 seconds
+      if (millis() - buttonPressStartTime >= 5000) {
+        screenOn = !screenOn;
+        if (screenOn) {
+          display.ssd1306_command(SSD1306_DISPLAYON);
+          display.clearDisplay();
+          display.display();
+        } else {
+          display.ssd1306_command(SSD1306_DISPLAYOFF);
         }
-        currentLine = "";
-        break; 
-      } else if (c != '\r') {
-        currentLine += c;
+        buttonHeld = false;
+        // Wait for button release to avoid rapid toggling
+        while (digitalRead(BUTTON_SELECT) == LOW) {
+          delay(10);
+        }
       }
     }
-    client.stop();
-    Serial.println("Client disconnected.");
-  }*/
+  } else {
+    buttonHeld = false;
+  }
 }
 
-// --- UI AND MENU FUNCTIONS (UNCHANGED) ---
-// ... (The code for handleLocalInput, drawMenu, performAction, chooseLength, etc. is omitted for brevity but should be included here)
 void do_action_up() {
   selector--;
   if (selector < 0) selector = MENU_ITEMS_COUNT - 1;
@@ -349,7 +358,7 @@ void drawMenu() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 4; i++) {
     int item_index = top_line_index + i;
     if (item_index < MENU_ITEMS_COUNT) {
       display.setCursor(10, 5 + i * 10);
@@ -364,13 +373,7 @@ void drawMenu() {
 
 void performAction() {
   switch (selector) {
-    case 0:
-      display.clearDisplay();
-      display.setCursor(10, 12);
-      display.print("Use PC app to gen.");
-      display.display();
-      delay(2000);
-      break;
+    case 0: runPasswordGeneration(complexityLevel);  break;
     case 1: chooseLength(); break;
     case 2: chooseComplexity(); break;
     case 3: displayAbout(); break;
@@ -378,12 +381,11 @@ void performAction() {
 }
 void chooseLength() {
   bool setting = true;
+  delay(debounceDelay);
   while (setting) {
-    if ((millis() - lastDebounceTime) > debounceDelay) {
-      if (digitalRead(BUTTON_UP) == LOW) { passwordLength++; if (passwordLength > 64) passwordLength = 64; lastDebounceTime = millis(); 
-      if (digitalRead(BUTTON_DOWN) == LOW) { passwordLength--; if (passwordLength < 8) passwordLength = 8; lastDebounceTime = millis(); }
-      if (digitalRead(BUTTON_SELECT) == LOW) { setting = false; lastDebounceTime = millis(); }
-    }
+    if (digitalRead(BUTTON_UP) == LOW) { delay(debounceDelay); passwordLength++; if (passwordLength > MAX_PASSWORD_LEN) passwordLength = MIN_PASSWORD_LEN; } 
+    if (digitalRead(BUTTON_DOWN) == LOW) { delay(debounceDelay); passwordLength--; if (passwordLength < MIN_PASSWORD_LEN) passwordLength = MAX_PASSWORD_LEN; }
+    if (digitalRead(BUTTON_SELECT) == LOW) { setting = false; }
     display.clearDisplay();
     display.setCursor(0, 0); display.print("Set Length (8-64)");
     display.setCursor(0, 12); display.print("Up/Down=+1/-1 Sel=OK");
@@ -391,12 +393,13 @@ void chooseLength() {
     display.setTextSize(1); display.display();
   }
   delay(200);
-  }
 }
+
 void chooseComplexity() {
   bool setting = true;
   int tempSelector = complexityLevel;
   int numComplexityLevels = sizeof(complexityNames) / sizeof(char*);
+  delay(debounceDelay);
   while (setting) {
     if ((millis() - lastDebounceTime) > debounceDelay) {
       if (digitalRead(BUTTON_UP) == LOW) { tempSelector--; if (tempSelector < 0) tempSelector = numComplexityLevels - 1; lastDebounceTime = millis(); }
@@ -424,28 +427,31 @@ void displayAbout() {
   while(digitalRead(BUTTON_SELECT) == HIGH);
 }
 
-
 esp_err_t wifiInitAP(void)
 {
-  // Initialising access point with needed configs
+  // Initialise AP stack
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
+
   esp_netif_t* p_netif = esp_netif_create_default_wifi_ap();
-  esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_WIFI_AP();
-  esp_netif_t* wifi_netif = esp_netif_new(&netif_cfg);
-  ESP_LOGI(TAG, "%p", eth_netif);
-  
+
+  // initialise IP address for p_netif interface
+  esp_netif_ip_info_t if_info;
+  IP4_ADDR(&if_info.ip, 192, 168, 1, 4);
+  IP4_ADDR(&if_info.gw, 192, 168, 1, 1);
+  IP4_ADDR(&if_info.netmask, 255, 255, 255, 0);
+
+  ESP_ERROR_CHECK(esp_netif_dhcps_stop(p_netif)); /* stop previously running DHCP */
+  ESP_ERROR_CHECK(esp_netif_set_ip_info(p_netif, &if_info));
+  ESP_ERROR_CHECK(esp_netif_dhcps_start(p_netif));
+
   ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
   
+  // Create our wifi network
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&cfg)); 
 
   // Get IP address of ESP32
-  //esp_netif_t * p_netif = esp_netif_create_default_wifi_ap();
-  esp_netif_ip_info_t if_info;
-  ESP_ERROR_CHECK(esp_netif_get_ip_info(p_netif, &if_info));
-  ESP_LOGI(TAG, "ESP32 IP:" IPSTR, IP2STR(&if_info.ip));
-
   wifi_config_t wifi_config = {
     .ap = {
       .ssid = AP_SSID,
@@ -460,6 +466,11 @@ esp_err_t wifiInitAP(void)
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
   ESP_ERROR_CHECK(esp_wifi_start());
+
+  esp_netif_ip_info_t ip_info;
+  ESP_ERROR_CHECK(esp_netif_get_ip_info(p_netif, &ip_info));
+  ESP_LOGI(TAG, "ESP32 IP:" IPSTR, IP2STR(&ip_info.ip));
+
   return ESP_OK;
 }
 
@@ -505,7 +516,26 @@ void tcpSendMessage(char* msg)
   }
 }
 
-/*void tcpSendBytes(byte msg[MAX_LEN_TCP_MSG])
+// Show a centered qr code on screen and wait
+void displayQR(String text)
 {
+  QRCode qr;
+  uint8_t qrcodeData[qrcode_getBufferSize(2)];
+  qrcode_initText(&qr, qrcodeData, 2, 0, text.c_str());
 
-}*/
+
+  uint8_t offsetX = (SCREEN_WIDTH - (qr.size * 2)) / 2;
+  uint8_t offsetY = (SCREEN_HEIGHT - (qr.size * 2)) / 2;
+
+  display.clearDisplay();
+  for (uint8_t y = 0; y < qr.size; y++) {
+    for (uint8_t x = 0; x < qr.size; x++) {
+      if (qrcode_getModule(&qr, x, y)) {
+        display.fillRect(offsetX + (x * QR_SCALE), offsetY + (y * QR_SCALE), 2, 2, WHITE);
+      }
+    }
+  }
+  display.display();
+  delay(200);
+  while(digitalRead(BUTTON_SELECT) == HIGH);
+}
